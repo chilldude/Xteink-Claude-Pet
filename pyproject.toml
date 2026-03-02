@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "claude-pet"
 version = "0.1.0"
 description = "Daemon bridging Claude Code hooks to an Xteink X4 e-ink display"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 dependencies = [
     "pyserial>=3.5",
     "cobs>=1.2.1",

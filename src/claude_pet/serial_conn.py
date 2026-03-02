@@ -36,9 +36,9 @@ X4_PID = 0x1001
 
 # Timing constants
 SCAN_INTERVAL_S = 2.0
-ACK_TIMEOUT_S = 0.1
-ACK_RETRIES = 3
-HEARTBEAT_INTERVAL_S = 5.0
+ACK_TIMEOUT_S = 4.0       # e-ink full refresh blocks firmware for 2-3s
+ACK_RETRIES = 2
+HEARTBEAT_INTERVAL_S = 10.0
 MISSED_PONG_LIMIT = 3
 BAUD_RATE = 115200  # USB CDC ignores this, but pyserial needs a value
 
@@ -67,14 +67,16 @@ class SerialConnection:
         # Incoming COBS frame buffer
         self._rx_buf = bytearray()
 
-        # Parsed responses waiting to be consumed
-        self._response_queue: asyncio.Queue[Response] = asyncio.Queue()
+        # These are created lazily in _ensure_async_primitives() to avoid
+        # Python 3.9's "attached to a different loop" error.
+        self._response_queue: Optional[asyncio.Queue[Response]] = None
+        self._connected: Optional[asyncio.Event] = None
 
         # External callback for unsolicited device messages (BUTTON, BATTERY)
         self.on_unsolicited: Optional[Callable[[Response], None]] = None
 
-        # Connection state
-        self._connected = asyncio.Event()
+        # Connection state (non-async flag for quick checks)
+        self._is_connected = False
         self._device_path: Optional[str] = None
 
         # Heartbeat bookkeeping
@@ -83,13 +85,20 @@ class SerialConnection:
         # Shutdown flag
         self._closing = False
 
+    def _ensure_async_primitives(self) -> None:
+        """Create asyncio primitives inside the running event loop."""
+        if self._response_queue is None:
+            self._response_queue = asyncio.Queue()
+        if self._connected is None:
+            self._connected = asyncio.Event()
+
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
 
     @property
     def connected(self) -> bool:
-        return self._connected.is_set()
+        return self._is_connected
 
     @property
     def device_path(self) -> Optional[str]:
@@ -102,6 +111,7 @@ class SerialConnection:
     async def maintain_connection(self) -> None:
         """Loop forever: discover, connect, read, reconnect on failure."""
         self._loop = asyncio.get_running_loop()
+        self._ensure_async_primitives()
         while not self._closing:
             if not self.connected:
                 await self._try_connect()
@@ -132,6 +142,7 @@ class SerialConnection:
             self._rx_buf.clear()
             self._missed_pongs = 0
 
+        self._is_connected = True
         self._connected.set()
         log.info("Connected to X4 at %s", path)
 
@@ -147,8 +158,11 @@ class SerialConnection:
             self._device_path = None
             self._rx_buf.clear()
 
-        if self._connected.is_set():
+        was_connected = self._is_connected
+        self._is_connected = False
+        if self._connected is not None and self._connected.is_set():
             self._connected.clear()
+        if was_connected:
             log.info("Disconnected from X4 (%s)", reason)
 
     async def close(self) -> None:

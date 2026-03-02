@@ -44,6 +44,7 @@ class Cmd(IntEnum):
     REFRESH = 0x06
     SET_STATE = 0x07
     PING = 0x08
+    SESSION_LIST = 0x09
 
 
 # ---------------------------------------------------------------------------
@@ -227,3 +228,27 @@ def cmd_set_state(state_id: int) -> bytes:
 def cmd_ping() -> bytes:
     """Build a PING packet."""
     return build_packet(Cmd.PING)
+
+
+def cmd_session_list(
+    sessions: list[tuple[int, str, str]], selected_idx: int = 0
+) -> bytes:
+    """Build a SESSION_LIST packet.
+
+    *sessions* is a list of (state_id, display_name, detail_text) tuples.
+    Payload: count(1) + selected_idx(1)
+             + [state(1) + name_len(1) + name + detail_len(1) + detail]...
+    """
+    max_sessions = 16
+    max_name = 25
+    max_detail = 40
+    entries = sessions[:max_sessions]
+    parts = [struct.pack("<BB", len(entries), selected_idx)]
+    for state_id, name, detail in entries:
+        name_bytes = name.encode("utf-8")[:max_name]
+        detail_bytes = detail.encode("utf-8")[:max_detail]
+        parts.append(struct.pack("<BB", state_id, len(name_bytes)))
+        parts.append(name_bytes)
+        parts.append(struct.pack("<B", len(detail_bytes)))
+        parts.append(detail_bytes)
+    return build_packet(Cmd.SESSION_LIST, b"".join(parts))

@@ -6,8 +6,8 @@ Runs an asyncio event loop that gathers:
   - socket_server.listen()             -- receive hook events
 
 When a hook event arrives via the socket, it is mapped to a pet state
-and sent to the device as SET_STATE + TEXT commands.  On reconnect the
-current state is re-pushed.
+and sent to the device as a SESSION_LIST command showing all active
+sessions with their state icons and detail text.
 """
 
 from __future__ import annotations
@@ -19,17 +19,12 @@ import sys
 import time
 from typing import Optional
 
-from .protocol import Resp, Response, cmd_set_state, cmd_text, cmd_clear
+from .protocol import Resp, Response, cmd_session_list
 from .serial_conn import SerialConnection
 from .socket_server import SocketServer
 from .state_machine import State, resolve_state, STATE_LABELS, STATE_PRIORITY
 
 log = logging.getLogger(__name__)
-
-# Display layout constants (for text placement on 800x480)
-STATUS_TEXT_X = 50
-STATUS_TEXT_Y = 430
-STATUS_TEXT_SIZE = 2
 
 
 class Daemon:
@@ -37,6 +32,9 @@ class Daemon:
 
     # Seconds before a session is considered stale and ignored
     SESSION_STALE_TIMEOUT = 120.0
+
+    # Minimum seconds between session list sends (e-ink refresh takes 2-3s)
+    SESSION_LIST_INTERVAL = 5.0
 
     def __init__(self) -> None:
         self._serial = SerialConnection()
@@ -46,6 +44,15 @@ class Daemon:
 
         # Per-session state tracking: session_id -> (State, last_seen_timestamp)
         self._sessions: dict[str, tuple[State, float]] = {}
+
+        # Session display names: session_id -> slug/name
+        self._session_names: dict[str, str] = {}
+
+        # Per-session detail text: session_id -> detail string
+        self._session_details: dict[str, str] = {}
+
+        # Dirty flag for debounced session list sends
+        self._session_list_dirty = False
 
         # Wire up unsolicited serial messages
         self._serial.on_unsolicited = self._on_device_message
@@ -72,6 +79,9 @@ class Daemon:
 
         log.info("claude-petd starting")
 
+        # Initialize async primitives inside the running loop (Python 3.9 compat)
+        self._serial._ensure_async_primitives()
+
         # Wait for connection, then push initial state
         asyncio.create_task(self._resync_on_connect())
 
@@ -80,6 +90,7 @@ class Daemon:
                 self._serial.maintain_connection(),
                 self._serial.heartbeat_loop(),
                 self._socket.listen(),
+                self._session_list_loop(),
             )
         except asyncio.CancelledError:
             pass
@@ -103,7 +114,14 @@ class Daemon:
     # Hook event handling (called from socket server)
     # ------------------------------------------------------------------
 
-    def _on_hook_event(self, hook: str, detail: Optional[str], session: Optional[str] = None) -> None:
+    def _on_hook_event(
+        self,
+        hook: str,
+        detail: Optional[str],
+        session: Optional[str] = None,
+        session_name: Optional[str] = None,
+        detail_text: Optional[str] = None,
+    ) -> None:
         """Map a hook event to a state transition and push to device.
 
         Tracks per-session states.  The highest-priority state across all
@@ -115,19 +133,21 @@ class Daemon:
             log.debug("No state mapping for hook=%s detail=%s", hook, detail)
             return
 
-        # Update this session's state
+        # Update this session's state, display name, and detail text
         self._sessions[session_id] = (new_state, time.monotonic())
+        if session_name:
+            self._session_names[session_id] = session_name
+        if detail_text:
+            self._session_details[session_id] = detail_text
 
         # Remove sessions that ended (Stop hook)
         if hook == "Stop":
             self._sessions.pop(session_id, None)
+            self._session_names.pop(session_id, None)
+            self._session_details.pop(session_id, None)
 
         # Resolve highest-priority state across all active sessions
         winning_state = self._resolve_priority()
-
-        if winning_state == self._display_state:
-            log.debug("Display state unchanged: %s", winning_state.name)
-            return
 
         old = self._display_state
         self._display_state = winning_state
@@ -136,10 +156,8 @@ class Daemon:
             old.name, winning_state.name, session_id, hook, len(self._sessions),
         )
 
-        # Fire-and-forget: schedule the send on the event loop
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            loop.create_task(self._push_state(winning_state))
+        # Mark session list dirty — periodic loop will send it
+        self._session_list_dirty = True
 
     def _resolve_priority(self) -> State:
         """Return the highest-priority state across all non-stale sessions."""
@@ -153,6 +171,7 @@ class Daemon:
         for sid in stale:
             log.debug("Pruning stale session: %s", sid)
             del self._sessions[sid]
+            self._session_details.pop(sid, None)
 
         if not self._sessions:
             return State.IDLE
@@ -163,19 +182,45 @@ class Daemon:
             key=lambda s: STATE_PRIORITY.get(s, 0),
         )
 
-    async def _push_state(self, state: State) -> None:
-        """Send SET_STATE and status text to the device."""
+    async def _session_list_loop(self) -> None:
+        """Periodically send the session list if dirty."""
+        while self._running:
+            if self._session_list_dirty and self._serial.connected:
+                self._session_list_dirty = False
+                await self._push_session_list()
+            await asyncio.sleep(self.SESSION_LIST_INTERVAL)
+
+    async def _push_session_list(self) -> None:
+        """Send the full session list to the device."""
         if not self._serial.connected:
             return
 
-        # Send SET_STATE
-        await self._serial.send(cmd_set_state(state))
+        # Prune stale sessions first
+        self._resolve_priority()
 
-        # Send status label text
-        label = STATE_LABELS.get(state, state.name)
-        await self._serial.send(
-            cmd_text(STATUS_TEXT_X, STATUS_TEXT_Y, STATUS_TEXT_SIZE, label)
-        )
+        # Build list of (state_id, display_name, detail_text) tuples
+        entries: list[tuple[int, str, str]] = []
+        for sid, (state, _ts) in self._sessions.items():
+            name = self._session_names.get(sid, sid[:25])
+            detail = self._session_details.get(sid, "")
+            entries.append((state.value, name, detail))
+
+        # Compute selected_idx: highest-priority session
+        selected_idx = 0
+        if entries:
+            best_priority = -1
+            for i, (state_val, _, _) in enumerate(entries):
+                try:
+                    st = State(state_val)
+                    p = STATE_PRIORITY.get(st, 0)
+                except ValueError:
+                    p = 0
+                if p > best_priority:
+                    best_priority = p
+                    selected_idx = i
+
+        log.info("Sending session list: %d entries, selected=%d", len(entries), selected_idx)
+        await self._serial.send(cmd_session_list(entries, selected_idx))
 
     # ------------------------------------------------------------------
     # Reconnect sync
@@ -187,7 +232,7 @@ class Daemon:
             # Wait for connection
             await self._serial._connected.wait()
             log.info("Device connected, syncing state: %s", self._display_state.name)
-            await self._push_state(self._display_state)
+            self._session_list_dirty = True  # will be sent by _session_list_loop
             # Now wait for disconnect so we can re-sync next time
             while self._serial.connected and self._running:
                 await asyncio.sleep(0.5)
