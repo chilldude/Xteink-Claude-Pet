@@ -77,7 +77,7 @@
 #define SERIAL_TIMEOUT_MS    60000  // 60s no serial -> auto IDLE
 #define DEBOUNCE_MS          50
 #define POWER_HOLD_SLEEP_MS  2000   // Hold power 2s for sleep
-#define FULL_REFRESH_INTERVAL 5     // Full refresh every N partial refreshes
+#define FULL_REFRESH_INTERVAL 60    // Full refresh every N partial refreshes (~30s at idle)
 
 // ============================================================================
 // Forward Declarations
@@ -155,6 +155,7 @@ uint32_t lastAdc2ChangeMs    = 0;
 // Display state
 bool displayInited = false;
 bool sleeping      = false;
+uint32_t bootTime  = 0;   // millis() at boot, used to ignore button during startup
 
 // ============================================================================
 // CRC-16/CCITT (polynomial 0x1021, init 0xFFFF)
@@ -748,6 +749,9 @@ void onPacketReceived(const uint8_t* buffer, size_t size) {
 // ============================================================================
 
 void checkPowerButton() {
+    // Ignore button for first 5 seconds after boot to avoid phantom presses
+    if (millis() - bootTime < 5000) return;
+
     bool pressed = (digitalRead(BTN_POWER) == LOW);
 
     if (pressed && !powerBtnPressed) {
@@ -930,6 +934,7 @@ void setup() {
     packetSerial.setPacketHandler(&onPacketReceived);
 
     // Initial state
+    bootTime = millis();
     lastSerialDataMs = millis();
     setState(STATE_IDLE);
     strncpy(detailText, "Waiting for host...", sizeof(detailText) - 1);

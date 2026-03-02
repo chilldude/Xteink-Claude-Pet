@@ -63,3 +63,15 @@ STATE_LABELS: dict[State, str] = {
     State.SUCCESS:  "done!",
     State.SLEEPING: "zzz",
 }
+
+# Priority ranking: higher number = more interesting = wins in multi-session.
+STATE_PRIORITY: dict[State, int] = {
+    State.SLEEPING: 0,
+    State.IDLE:     1,
+    State.WAITING:  2,
+    State.SUCCESS:  3,
+    State.THINKING: 4,
+    State.RUNNING:  5,
+    State.CODING:   6,
+    State.ERROR:    7,
+}

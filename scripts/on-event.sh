@@ -6,7 +6,8 @@
 SOCKET="$HOME/.claude-pet/state.sock"
 HOOK="$1"
 DETAIL="${2:-}"
+SESSION="${SESSION_ID:-unknown}"
 
 # Non-blocking write to Unix socket. Timeout 100ms.
-echo "{\"hook\":\"$HOOK\",\"detail\":\"$DETAIL\"}" | \
+echo "{\"hook\":\"$HOOK\",\"detail\":\"$DETAIL\",\"session\":\"$SESSION\"}" | \
     socat -t0.1 - UNIX-CONNECT:"$SOCKET" 2>/dev/null || true

@@ -16,12 +16,13 @@ import asyncio
 import logging
 import signal
 import sys
+import time
 from typing import Optional
 
 from .protocol import Resp, Response, cmd_set_state, cmd_text, cmd_clear
 from .serial_conn import SerialConnection
 from .socket_server import SocketServer
-from .state_machine import State, resolve_state, STATE_LABELS
+from .state_machine import State, resolve_state, STATE_LABELS, STATE_PRIORITY
 
 log = logging.getLogger(__name__)
 
@@ -34,11 +35,17 @@ STATUS_TEXT_SIZE = 2
 class Daemon:
     """The main claude-pet daemon."""
 
+    # Seconds before a session is considered stale and ignored
+    SESSION_STALE_TIMEOUT = 120.0
+
     def __init__(self) -> None:
         self._serial = SerialConnection()
         self._socket = SocketServer(on_event=self._on_hook_event)
-        self._current_state: State = State.IDLE
+        self._display_state: State = State.IDLE  # what's currently shown on device
         self._running = False
+
+        # Per-session state tracking: session_id -> (State, last_seen_timestamp)
+        self._sessions: dict[str, tuple[State, float]] = {}
 
         # Wire up unsolicited serial messages
         self._serial.on_unsolicited = self._on_device_message
@@ -96,25 +103,65 @@ class Daemon:
     # Hook event handling (called from socket server)
     # ------------------------------------------------------------------
 
-    def _on_hook_event(self, hook: str, detail: Optional[str]) -> None:
-        """Map a hook event to a state transition and push to device."""
+    def _on_hook_event(self, hook: str, detail: Optional[str], session: Optional[str] = None) -> None:
+        """Map a hook event to a state transition and push to device.
+
+        Tracks per-session states.  The highest-priority state across all
+        active sessions is what gets displayed on the pet.
+        """
+        session_id = session or "default"
         new_state = resolve_state(hook, detail)
         if new_state is None:
             log.debug("No state mapping for hook=%s detail=%s", hook, detail)
             return
 
-        if new_state == self._current_state:
-            log.debug("State unchanged: %s", new_state.name)
+        # Update this session's state
+        self._sessions[session_id] = (new_state, time.monotonic())
+
+        # Remove sessions that ended (Stop hook)
+        if hook == "Stop":
+            self._sessions.pop(session_id, None)
+
+        # Resolve highest-priority state across all active sessions
+        winning_state = self._resolve_priority()
+
+        if winning_state == self._display_state:
+            log.debug("Display state unchanged: %s", winning_state.name)
             return
 
-        old = self._current_state
-        self._current_state = new_state
-        log.info("State: %s -> %s (hook=%s)", old.name, new_state.name, hook)
+        old = self._display_state
+        self._display_state = winning_state
+        log.info(
+            "Display: %s -> %s (session=%s, hook=%s, %d active sessions)",
+            old.name, winning_state.name, session_id, hook, len(self._sessions),
+        )
 
         # Fire-and-forget: schedule the send on the event loop
         loop = asyncio.get_event_loop()
         if loop.is_running():
-            loop.create_task(self._push_state(new_state))
+            loop.create_task(self._push_state(winning_state))
+
+    def _resolve_priority(self) -> State:
+        """Return the highest-priority state across all non-stale sessions."""
+        now = time.monotonic()
+
+        # Prune stale sessions
+        stale = [
+            sid for sid, (_, ts) in self._sessions.items()
+            if now - ts > self.SESSION_STALE_TIMEOUT
+        ]
+        for sid in stale:
+            log.debug("Pruning stale session: %s", sid)
+            del self._sessions[sid]
+
+        if not self._sessions:
+            return State.IDLE
+
+        # Pick the state with the highest priority
+        return max(
+            (state for state, _ in self._sessions.values()),
+            key=lambda s: STATE_PRIORITY.get(s, 0),
+        )
 
     async def _push_state(self, state: State) -> None:
         """Send SET_STATE and status text to the device."""
@@ -139,8 +186,8 @@ class Daemon:
         while self._running:
             # Wait for connection
             await self._serial._connected.wait()
-            log.info("Device connected, syncing state: %s", self._current_state.name)
-            await self._push_state(self._current_state)
+            log.info("Device connected, syncing state: %s", self._display_state.name)
+            await self._push_state(self._display_state)
             # Now wait for disconnect so we can re-sync next time
             while self._serial.connected and self._running:
                 await asyncio.sleep(0.5)

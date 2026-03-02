@@ -30,7 +30,7 @@ class SocketServer:
     def __init__(
         self,
         sock_path: Path = DEFAULT_SOCK_PATH,
-        on_event: Optional[Callable[[str, Optional[str]], None]] = None,
+        on_event: Optional[Callable[[str, Optional[str], Optional[str]], None]] = None,
     ) -> None:
         self._sock_path = sock_path
         self.on_event = on_event  # callback(hook, detail)
@@ -108,11 +108,12 @@ class SocketServer:
                     continue
 
                 detail = msg.get("detail")
-                log.debug("Event: hook=%s detail=%s", hook, detail)
+                session = msg.get("session")
+                log.debug("Event: hook=%s detail=%s session=%s", hook, detail, session)
 
                 if self.on_event is not None:
                     try:
-                        self.on_event(hook, detail)
+                        self.on_event(hook, detail, session)
                     except Exception:
                         log.exception("Error in on_event callback")
 
