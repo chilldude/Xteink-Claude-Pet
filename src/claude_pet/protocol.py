@@ -231,24 +231,25 @@ def cmd_ping() -> bytes:
 
 
 def cmd_session_list(
-    sessions: list[tuple[int, str, str]], selected_idx: int = 0
+    sessions: list[tuple[int, str, str, int]], selected_idx: int = 0
 ) -> bytes:
     """Build a SESSION_LIST packet.
 
-    *sessions* is a list of (state_id, display_name, detail_text) tuples.
+    *sessions* is a list of (state_id, display_name, detail_text, tokens) tuples.
     Payload: count(1) + selected_idx(1)
-             + [state(1) + name_len(1) + name + detail_len(1) + detail]...
+             + [state(1) + name_len(1) + name + detail_len(1) + detail + tokens(4, LE)]...
     """
     max_sessions = 16
     max_name = 25
     max_detail = 40
     entries = sessions[:max_sessions]
     parts = [struct.pack("<BB", len(entries), selected_idx)]
-    for state_id, name, detail in entries:
+    for state_id, name, detail, tokens in entries:
         name_bytes = name.encode("utf-8")[:max_name]
         detail_bytes = detail.encode("utf-8")[:max_detail]
         parts.append(struct.pack("<BB", state_id, len(name_bytes)))
         parts.append(name_bytes)
         parts.append(struct.pack("<B", len(detail_bytes)))
         parts.append(detail_bytes)
+        parts.append(struct.pack("<I", tokens))
     return build_packet(Cmd.SESSION_LIST, b"".join(parts))

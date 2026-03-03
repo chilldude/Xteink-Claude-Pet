@@ -47,6 +47,7 @@ import glob, os
 session_name = session
 for jsonl in glob.glob(os.path.expanduser(f'~/.claude/projects/*/{session}.jsonl')):
     title = slug = ''
+    tokens = 0
     try:
         with open(jsonl) as f:
             for line in f:
@@ -56,6 +57,9 @@ for jsonl in glob.glob(os.path.expanduser(f'~/.claude/projects/*/{session}.jsonl
                         title = obj.get('customTitle', '')
                     if 'slug' in obj:
                         slug = obj['slug']
+                    if obj.get('type') == 'assistant' and isinstance(obj.get('message'), dict):
+                        usage = obj['message'].get('usage', {})
+                        tokens += usage.get('input_tokens', 0) + usage.get('output_tokens', 0)
                 except:
                     pass
     except:
@@ -69,6 +73,7 @@ msg = json.dumps({
     'session': session,
     'session_name': session_name,
     'detail_text': detail_text,
+    'tokens': tokens,
 })
 print(msg)
 " "$HOOK" "$INPUT" 2>/dev/null | \

@@ -106,7 +106,6 @@ struct SessionEntry {
 void initDisplay();
 void showBootSplash();
 void drawSplitPane();
-void drawRow(uint8_t visibleIdx);
 void drawScaledXBM(const uint8_t* bitmap, int16_t x, int16_t y,
                     int16_t w, int16_t h, int scale);
 void drawIcon(int16_t x, int16_t y, uint8_t stateId, bool inverted);
@@ -141,7 +140,6 @@ uint8_t sessionCount   = 0;
 uint8_t selectedIndex  = 0;
 uint8_t scrollOffset   = 0;
 bool    screenDirty    = true;
-bool    rightPaneDirty = false;
 
 // Serial tracking
 uint32_t lastSerialDataMs = 0;
@@ -159,10 +157,8 @@ uint32_t lastAdc2ChangeMs    = 0;
 bool displayInited = false;
 bool sleeping      = false;
 uint32_t bootTime  = 0;
-
-// Right pane deferral — wait for user to stop scrolling before full redraw
-#define RIGHT_PANE_DEFER_MS  400
-uint32_t lastMoveSelectionMs = 0;
+uint32_t lastDebugMs = 0;
+char debugText[40] = "";
 
 // Hourly full refresh to clear e-ink ghosting
 #define FULL_REFRESH_INTERVAL_MS 3600000UL
@@ -349,87 +345,7 @@ void drawSplitPane() {
     } while (display.nextPage());
 
     screenDirty = false;
-    rightPaneDirty = false;
     lastFullRefreshMs = millis();
-}
-
-// Row-band partial update: redraws a single visible list row (full-width, LIST_ROW_H tall)
-void drawRow(uint8_t visibleIdx) {
-    if (sleeping) return;
-    uint8_t idx = scrollOffset + visibleIdx;
-    if (idx >= sessionCount) return;
-    initDisplay();
-
-    int16_t rowY = visibleIdx * LIST_ROW_H;
-    bool selected = (idx == selectedIndex);
-
-    // Full-width strip to avoid SSD1677 hang on non-full-width full-height windows
-    // Height = LIST_ROW_H (53px), so refresh is ~60-100ms instead of ~600ms
-    display.setPartialWindow(0, rowY, DISP_W, LIST_ROW_H);
-    display.firstPage();
-    do {
-        display.fillScreen(GxEPD_WHITE);
-
-        // Left pane: row content
-        if (selected) {
-            display.fillRect(0, rowY, LEFT_PANE_W, LIST_ROW_H, GxEPD_BLACK);
-        }
-        if (!selected && visibleIdx > 0) {
-            display.drawFastHLine(0, rowY, LEFT_PANE_W, GxEPD_BLACK);
-        }
-
-        display.setFont(&FreeMono9pt7b);
-        display.setTextColor(selected ? GxEPD_WHITE : GxEPD_BLACK);
-        display.setCursor(LIST_TEXT_X, rowY + LIST_TEXT_BASELINE);
-        display.print(sessionList[idx].name);
-
-        drawIcon(LIST_ICON_X, rowY + LIST_ICON_Y_OFF, sessionList[idx].state, selected);
-
-        // Divider
-        display.fillRect(DIVIDER_X, rowY, 2, LIST_ROW_H, GxEPD_BLACK);
-
-        // Right pane: whatever falls in this strip (mascot/text/nothing)
-        uint8_t detailState = STATE_IDLE;
-        const char* detailName = "No session";
-        const char* detailStateLabel = "Idle";
-        const char* detailInfo = "";
-
-        if (sessionCount > 0 && selectedIndex < sessionCount) {
-            const SessionEntry& sel = sessionList[selectedIndex];
-            detailState = sel.state;
-            detailName = sel.name;
-            detailStateLabel = stateLabel(sel.state);
-            detailInfo = sel.detail;
-        }
-
-        // Mascot (only rows that intersect this strip)
-        const uint8_t* mascot = stateSprite[detailState];
-        if (mascot && rowY < MASCOT_Y + MASCOT_DRAW_H && rowY + LIST_ROW_H > MASCOT_Y) {
-            drawScaledXBM(mascot, MASCOT_X, MASCOT_Y,
-                          SPRITE_W, SPRITE_H, MASCOT_SCALE);
-        }
-
-        // Text labels (only if they fall in this strip)
-        if (rowY <= DETAIL_NAME_Y && rowY + LIST_ROW_H > DETAIL_NAME_Y - 20) {
-            display.setFont(&FreeMonoBold12pt7b);
-            display.setTextColor(GxEPD_BLACK);
-            display.setCursor(DETAIL_NAME_X, DETAIL_NAME_Y);
-            display.print(detailName);
-        }
-        if (rowY <= DETAIL_STATE_Y && rowY + LIST_ROW_H > DETAIL_STATE_Y - 16) {
-            display.setFont(&FreeMono12pt7b);
-            display.setTextColor(GxEPD_BLACK);
-            display.setCursor(DETAIL_STATE_X, DETAIL_STATE_Y);
-            display.print(detailStateLabel);
-        }
-        if (rowY <= DETAIL_INFO_Y && rowY + LIST_ROW_H > DETAIL_INFO_Y - 14) {
-            display.setFont(&FreeMono9pt7b);
-            display.setTextColor(GxEPD_BLACK);
-            display.setCursor(DETAIL_INFO_X, DETAIL_INFO_Y);
-            display.print(detailInfo);
-        }
-
-    } while (display.nextPage());
 }
 
 void moveSelection(int8_t dir) {
@@ -439,26 +355,13 @@ void moveSelection(int8_t dir) {
     if (newIdx >= (int8_t)sessionCount) newIdx = sessionCount - 1;
     if ((uint8_t)newIdx == selectedIndex) return;
 
-    uint8_t oldIdx = selectedIndex;
     selectedIndex = (uint8_t)newIdx;
-
-    uint8_t oldScroll = scrollOffset;
     if (selectedIndex < scrollOffset) {
         scrollOffset = selectedIndex;
     } else if (selectedIndex >= scrollOffset + LIST_VISIBLE) {
         scrollOffset = selectedIndex - LIST_VISIBLE + 1;
     }
-
-    if (scrollOffset != oldScroll) {
-        // Scroll position changed — full redraw needed
-        screenDirty = true;
-    } else {
-        // Selection moved within visible window — fast row-band update
-        drawRow(oldIdx - scrollOffset);
-        drawRow(selectedIndex - scrollOffset);
-        rightPaneDirty = true;
-        lastMoveSelectionMs = millis();
-    }
+    screenDirty = true;
 }
 
 // ============================================================================
@@ -637,7 +540,7 @@ void onPacketReceived(const uint8_t* buffer, size_t size) {
 
         case CMD_SESSION_LIST: {
             // Wire format: count(1) + selected_idx(1)
-            //   + [state(1) + name_len(1) + name + detail_len(1) + detail + tokens(4)]...
+            //   + [state(1) + name_len(1) + name + detail_len(1) + detail]...
             if (payloadLen < 2) {
                 sendError(ERR_BAD_PARAM, "SESSION_LIST: need count+sel");
                 return;
@@ -674,9 +577,6 @@ void onPacketReceived(const uint8_t* buffer, size_t size) {
                 } else {
                     sessionList[i].detail[0] = '\0';
                 }
-
-                // Skip tokens field (4 bytes, uint32 LE) sent by daemon
-                if (off + 4 <= payloadLen) off += 4;
 
                 parsed++;
             }
@@ -739,79 +639,42 @@ void checkPowerButton() {
     }
 }
 
-// G1 has 4 buttons across 2 rockers (resistor ladder):
-//   Rocker 1 (back/go): back ~3534, go ~2702 → scroll DOWN
-//   Rocker 2 (up/down): up ~1500, down ~5   → scroll UP
-// G2 has 2 buttons on 1 rocker:
-//   Rocker 3 (left/right): left ~2240, right ~5
+#define ADC_THRESHOLD_NONE   3800
+#define ADC_THRESHOLD_BTN_A  2000
+#define ADC_THRESHOLD_BTN_B  1000
+#define ADC_HYSTERESIS       200
 
-#define ADC_NO_PRESS  3800
-
-// G1: 4 levels — returns 0 (none), 1 (back), 2 (go), 3 (up), 4 (down)
-static uint8_t classifyG1(int value) {
-    if (value > ADC_NO_PRESS) return 0;
-    if (value > 3100) return 1;   // back ~3534
-    if (value > 2100) return 2;   // go   ~2702
-    if (value > 750)  return 3;   // up   ~1500
-    return 4;                      // down ~5
-}
-
-// G2: 2 levels — returns 0 (none), 1 (left), 2 (right)
-static uint8_t classifyG2(int value) {
-    if (value > ADC_NO_PRESS) return 0;
-    if (value > 1100) return 1;   // left  ~2240
-    return 2;                      // right ~5
-}
-
-#define REPEAT_DELAY_MS  500
-#define REPEAT_RATE_MS   200
-
-static uint32_t adc1RepeatMs = 0;
-static uint32_t adc2RepeatMs = 0;
-
-// G1 rocker direction: rocker 1 (btn 1,2) = DOWN, rocker 2 (btn 3,4) = UP
-static int8_t g1Direction(uint8_t btn) {
-    if (btn <= 2) return 1;   // rocker 1 (back/go) → scroll DOWN
-    return -1;                 // rocker 2 (up/down) → scroll UP
+static uint8_t classifyAdcButton(int value) {
+    if (value < ADC_THRESHOLD_BTN_B + ADC_HYSTERESIS) return 2;
+    if (value < ADC_THRESHOLD_BTN_A + ADC_HYSTERESIS) return 1;
+    return 0;
 }
 
 void checkAdcButtons() {
     uint32_t now = millis();
 
-    // G1: 4 buttons across 2 rockers
     int adc1 = analogRead(BTN_ADC1);
-    uint8_t btn1 = classifyG1(adc1);
-    uint8_t prevBtn1 = classifyG1(lastAdc1Value);
-
+    uint8_t btn1 = classifyAdcButton(adc1);
+    uint8_t prevBtn1 = classifyAdcButton(lastAdc1Value);
     if (btn1 != prevBtn1 && (now - lastAdc1ChangeMs) >= DEBOUNCE_MS) {
         if (btn1 > 0) {
             sendButton(btn1);
-            moveSelection(g1Direction(btn1));
-            adc1RepeatMs = now + REPEAT_DELAY_MS;
+            moveSelection(btn1 == 1 ? -1 : 1);
         }
         lastAdc1Value = adc1;
         lastAdc1ChangeMs = now;
-    } else if (btn1 > 0 && prevBtn1 == btn1 && now >= adc1RepeatMs) {
-        moveSelection(g1Direction(btn1));
-        adc1RepeatMs = now + REPEAT_RATE_MS;
     }
 
-    // G2: 2 buttons on 1 rocker
     int adc2 = analogRead(BTN_ADC2);
-    uint8_t btn2 = classifyG2(adc2);
-    uint8_t prevBtn2 = classifyG2(lastAdc2Value);
-
+    uint8_t btn2 = classifyAdcButton(adc2);
+    uint8_t prevBtn2 = classifyAdcButton(lastAdc2Value);
     if (btn2 != prevBtn2 && (now - lastAdc2ChangeMs) >= DEBOUNCE_MS) {
         if (btn2 > 0) {
-            sendButton(btn2 + 4);
+            sendButton(btn2 + 2);
             moveSelection(btn2 == 1 ? -1 : 1);
-            adc2RepeatMs = now + REPEAT_DELAY_MS;
         }
         lastAdc2Value = adc2;
         lastAdc2ChangeMs = now;
-    } else if (btn2 > 0 && prevBtn2 == btn2 && now >= adc2RepeatMs) {
-        moveSelection(btn2 == 1 ? -1 : 1);
-        adc2RepeatMs = now + REPEAT_RATE_MS;
     }
 }
 
@@ -902,19 +765,38 @@ void setup() {
 
 void loop() {
     packetSerial.update();
-    pollButtons();
 
     if (screenDirty) {
         drawSplitPane();
-        pollButtons();
-        packetSerial.update();
-    } else if (rightPaneDirty && (millis() - lastMoveSelectionMs >= RIGHT_PANE_DEFER_MS)) {
-        // Deferred right pane update — only fires after user stops scrolling
-        drawSplitPane();
-        pollButtons();
-        packetSerial.update();
     }
 
+    pollButtons();
     checkSerialTimeout();
+
+    // Debug: show raw ADC + power button values every 500ms
+    if (millis() - lastDebugMs >= 500) {
+        lastDebugMs = millis();
+        int a1 = analogRead(BTN_ADC1);
+        int a2 = analogRead(BTN_ADC2);
+        int pw = digitalRead(BTN_POWER);
+        snprintf(debugText, sizeof(debugText), "A1:%d A2:%d P:%d", a1, a2, pw);
+
+        initDisplay();
+        // Bottom-right corner
+        int16_t dx = 592;
+        int16_t dy = 452;
+        int16_t dw = 208;
+        int16_t dh = 28;
+        display.setPartialWindow(dx, dy, dw, dh);
+        display.firstPage();
+        do {
+            display.fillRect(dx, dy, dw, dh, GxEPD_WHITE);
+            display.setFont(&FreeMono9pt7b);
+            display.setTextColor(GxEPD_BLACK);
+            display.setCursor(dx + 4, dy + 20);
+            display.print(debugText);
+        } while (display.nextPage());
+    }
+
     delay(1);
 }

@@ -13,10 +13,13 @@ sessions with their state icons and detail text.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import signal
 import sys
 import time
+from pathlib import Path
 from typing import Optional
 
 from .protocol import Resp, Response, cmd_session_list
@@ -31,7 +34,8 @@ class Daemon:
     """The main claude-pet daemon."""
 
     # Seconds before a session is considered stale and ignored
-    SESSION_STALE_TIMEOUT = 120.0
+    # Long timeout — sessions should be removed by Stop hook, not staleness
+    SESSION_STALE_TIMEOUT = 3600.0
 
     # Minimum seconds between session list sends (e-ink refresh takes 2-3s)
     SESSION_LIST_INTERVAL = 5.0
@@ -50,6 +54,9 @@ class Daemon:
 
         # Per-session detail text: session_id -> detail string
         self._session_details: dict[str, str] = {}
+
+        # Per-session token counts: session_id -> total tokens
+        self._session_tokens: dict[str, int] = {}
 
         # Dirty flag for debounced session list sends
         self._session_list_dirty = False
@@ -78,6 +85,9 @@ class Daemon:
             loop.add_signal_handler(sig, self._request_shutdown)
 
         log.info("claude-petd starting")
+
+        # Pre-populate sessions from Claude's session index
+        self._scan_existing_sessions()
 
         # Initialize async primitives inside the running loop (Python 3.9 compat)
         self._serial._ensure_async_primitives()
@@ -111,6 +121,46 @@ class Daemon:
         log.info("claude-petd stopped")
 
     # ------------------------------------------------------------------
+    # Session discovery — pre-populate from Claude's session index
+    # ------------------------------------------------------------------
+
+    def _scan_existing_sessions(self) -> None:
+        """Read Claude's session-index.json and pre-populate active sessions.
+
+        This ensures sessions that are idle (waiting for user input) appear
+        on the device even if they haven't fired a hook since daemon start.
+        """
+        index_path = Path.home() / ".claude" / "session-index.json"
+        if not index_path.exists():
+            return
+
+        try:
+            data = json.loads(index_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return
+
+        # session-index.json is a dict: {session_id: {name, project, ...}}
+        if not isinstance(data, dict):
+            return
+
+        # Show ALL sessions regardless of project — user wants to see everything
+        for sid, info in data.items():
+            if not isinstance(info, dict):
+                continue
+
+            # Check if session has a recent JSONL file (indicates it exists)
+            name = info.get("name") or info.get("original_slug") or sid[:12]
+
+            # Only add if not already tracked (don't overwrite active states)
+            if sid not in self._sessions:
+                self._sessions[sid] = (State.IDLE, time.monotonic())
+                self._session_names[sid] = name
+                log.info("Discovered existing session: %s (%s)", name, sid[:8])
+
+        if self._sessions:
+            self._session_list_dirty = True
+
+    # ------------------------------------------------------------------
     # Hook event handling (called from socket server)
     # ------------------------------------------------------------------
 
@@ -121,6 +171,7 @@ class Daemon:
         session: Optional[str] = None,
         session_name: Optional[str] = None,
         detail_text: Optional[str] = None,
+        tokens: Optional[int] = None,
     ) -> None:
         """Map a hook event to a state transition and push to device.
 
@@ -139,12 +190,15 @@ class Daemon:
             self._session_names[session_id] = session_name
         if detail_text:
             self._session_details[session_id] = detail_text
+        if tokens is not None:
+            self._session_tokens[session_id] = tokens
 
         # Remove sessions that ended (Stop hook)
         if hook == "Stop":
             self._sessions.pop(session_id, None)
             self._session_names.pop(session_id, None)
             self._session_details.pop(session_id, None)
+            self._session_tokens.pop(session_id, None)
 
         # Resolve highest-priority state across all active sessions
         winning_state = self._resolve_priority()
@@ -172,6 +226,7 @@ class Daemon:
             log.debug("Pruning stale session: %s", sid)
             del self._sessions[sid]
             self._session_details.pop(sid, None)
+            self._session_tokens.pop(sid, None)
 
         if not self._sessions:
             return State.IDLE
@@ -198,41 +253,30 @@ class Daemon:
         # Prune stale sessions first
         self._resolve_priority()
 
-        # Build list of (state_id, display_name, detail_text) tuples
-        entries: list[tuple[int, str, str]] = []
+        # Build list of (state_id, display_name, detail_text, tokens) tuples
+        entries: list[tuple[int, str, str, int]] = []
         for sid, (state, _ts) in self._sessions.items():
             name = self._session_names.get(sid, sid[:25])
             detail = self._session_details.get(sid, "")
-            entries.append((state.value, name, detail))
+            tokens = self._session_tokens.get(sid, 0)
+            entries.append((state.value, name, detail, tokens))
 
-        # Compute selected_idx: highest-priority session
-        selected_idx = 0
-        if entries:
-            best_priority = -1
-            for i, (state_val, _, _) in enumerate(entries):
-                try:
-                    st = State(state_val)
-                    p = STATE_PRIORITY.get(st, 0)
-                except ValueError:
-                    p = 0
-                if p > best_priority:
-                    best_priority = p
-                    selected_idx = i
-
-        log.info("Sending session list: %d entries, selected=%d", len(entries), selected_idx)
-        await self._serial.send(cmd_session_list(entries, selected_idx))
+        log.info("Sending session list: %d entries", len(entries))
+        await self._serial.send(cmd_session_list(entries))
 
     # ------------------------------------------------------------------
     # Reconnect sync
     # ------------------------------------------------------------------
 
     async def _resync_on_connect(self) -> None:
-        """Whenever the device (re)connects, push the current state."""
+        """Whenever the device (re)connects, push the current state immediately."""
         while self._running:
             # Wait for connection
             await self._serial._connected.wait()
             log.info("Device connected, syncing state: %s", self._display_state.name)
-            self._session_list_dirty = True  # will be sent by _session_list_loop
+            # Push immediately — don't wait for the 5s debounce loop
+            await asyncio.sleep(0.5)  # brief delay for device to finish booting
+            await self._push_session_list()
             # Now wait for disconnect so we can re-sync next time
             while self._serial.connected and self._running:
                 await asyncio.sleep(0.5)
