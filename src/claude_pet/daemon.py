@@ -58,8 +58,15 @@ class Daemon:
         # Per-session token counts: session_id -> total tokens
         self._session_tokens: dict[str, int] = {}
 
+        # Per-session tool summaries: session_id -> summary string
+        self._session_summaries: dict[str, str] = {}
+
         # Dirty flag for debounced session list sends
         self._session_list_dirty = False
+        self._session_list_sending = False
+
+        # Track session-index.json mtime for periodic re-scan
+        self._session_index_mtime: float = 0.0
 
         # Wire up unsolicited serial messages
         self._serial.on_unsolicited = self._on_device_message
@@ -101,6 +108,7 @@ class Daemon:
                 self._serial.heartbeat_loop(),
                 self._socket.listen(),
                 self._session_list_loop(),
+                self._session_index_watch_loop(),
             )
         except asyncio.CancelledError:
             pass
@@ -160,6 +168,55 @@ class Daemon:
         if self._sessions:
             self._session_list_dirty = True
 
+        # Record mtime so watch loop doesn't immediately re-read
+        try:
+            self._session_index_mtime = index_path.stat().st_mtime
+        except OSError:
+            pass
+
+    # ------------------------------------------------------------------
+    # Periodic session-index.json re-scan (detect renames)
+    # ------------------------------------------------------------------
+
+    def _rescan_session_names(self) -> None:
+        """Re-read session-index.json if it changed, update names."""
+        index_path = Path.home() / ".claude" / "session-index.json"
+        try:
+            st = index_path.stat()
+        except OSError:
+            return
+        if st.st_mtime <= self._session_index_mtime:
+            return
+        self._session_index_mtime = st.st_mtime
+
+        try:
+            data = json.loads(index_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            return
+        if not isinstance(data, dict):
+            return
+
+        changed = False
+        for sid, info in data.items():
+            if not isinstance(info, dict):
+                continue
+            name = info.get("name") or info.get("original_slug") or sid[:12]
+            # Only update tracked sessions whose name actually changed
+            if sid in self._sessions and self._session_names.get(sid) != name:
+                log.info("Session renamed: %s -> %s (%s)",
+                         self._session_names.get(sid), name, sid[:8])
+                self._session_names[sid] = name
+                changed = True
+
+        if changed:
+            self._session_list_dirty = True
+
+    async def _session_index_watch_loop(self) -> None:
+        """Periodically check session-index.json for name changes."""
+        while self._running:
+            self._rescan_session_names()
+            await asyncio.sleep(10.0)
+
     # ------------------------------------------------------------------
     # Hook event handling (called from socket server)
     # ------------------------------------------------------------------
@@ -172,6 +229,7 @@ class Daemon:
         session_name: Optional[str] = None,
         detail_text: Optional[str] = None,
         tokens: Optional[int] = None,
+        summary: Optional[str] = None,
     ) -> None:
         """Map a hook event to a state transition and push to device.
 
@@ -192,6 +250,13 @@ class Daemon:
             self._session_details[session_id] = detail_text
         if tokens is not None:
             self._session_tokens[session_id] = tokens
+        if summary is not None:
+            self._session_summaries[session_id] = summary
+
+        # Reset turn data on new user message
+        if hook == "UserPromptSubmit":
+            self._session_tokens[session_id] = 0
+            self._session_summaries.pop(session_id, None)
 
         # Remove sessions that ended (Stop hook)
         if hook == "Stop":
@@ -199,6 +264,7 @@ class Daemon:
             self._session_names.pop(session_id, None)
             self._session_details.pop(session_id, None)
             self._session_tokens.pop(session_id, None)
+            self._session_summaries.pop(session_id, None)
 
         # Resolve highest-priority state across all active sessions
         winning_state = self._resolve_priority()
@@ -227,6 +293,7 @@ class Daemon:
             del self._sessions[sid]
             self._session_details.pop(sid, None)
             self._session_tokens.pop(sid, None)
+            self._session_summaries.pop(sid, None)
 
         if not self._sessions:
             return State.IDLE
@@ -249,17 +316,29 @@ class Daemon:
         """Send the full session list to the device."""
         if not self._serial.connected:
             return
+        if self._session_list_sending:
+            return  # another send is in flight; dirty flag will trigger next cycle
+        self._session_list_sending = True
+        self._session_list_dirty = False
 
+        try:
+            await self._do_push_session_list()
+        finally:
+            self._session_list_sending = False
+
+    async def _do_push_session_list(self) -> None:
+        """Actually build and send the session list packet."""
         # Prune stale sessions first
         self._resolve_priority()
 
-        # Build list of (state_id, display_name, detail_text, tokens) tuples
-        entries: list[tuple[int, str, str, int]] = []
+        # Build list of (state_id, display_name, detail_text, tokens, summary) tuples
+        entries: list[tuple[int, str, str, int, str]] = []
         for sid, (state, _ts) in self._sessions.items():
             name = self._session_names.get(sid, sid[:25])
             detail = self._session_details.get(sid, "")
             tokens = self._session_tokens.get(sid, 0)
-            entries.append((state.value, name, detail, tokens))
+            summary = self._session_summaries.get(sid, "")
+            entries.append((state.value, name, detail, tokens, summary))
 
         log.info("Sending session list: %d entries", len(entries))
         await self._serial.send(cmd_session_list(entries))
@@ -274,8 +353,9 @@ class Daemon:
             # Wait for connection
             await self._serial._connected.wait()
             log.info("Device connected, syncing state: %s", self._display_state.name)
-            # Push immediately — don't wait for the 5s debounce loop
-            await asyncio.sleep(0.5)  # brief delay for device to finish booting
+            # Wait for firmware to finish booting (display init + boot splash + delay + initial draw)
+            # Setup takes ~4s: Serial.begin(500ms) + display init + boot splash(600ms) + delay(2s) + drawSplitPane(600ms)
+            await asyncio.sleep(5.0)
             await self._push_session_list()
             # Now wait for disconnect so we can re-sync next time
             while self._serial.connected and self._running:

@@ -53,7 +53,7 @@ Three-layer system: **Claude Code hooks** → **Python daemon** → **ESP32 firm
 
 ### Python Daemon (`src/claude_pet/`)
 
-- **daemon.py** — asyncio event loop running 4 concurrent tasks: serial connection, heartbeat, socket server, debounced session list sender (5s interval)
+- **daemon.py** — asyncio event loop running 5 concurrent tasks: serial connection, heartbeat, socket server, debounced session list sender (5s interval), session-index watcher (10s poll for name changes)
 - **serial_conn.py** — auto-discovers device by USB VID `0x303A` / PID `0x1001`, COBS framing, ACK/retry, heartbeat PING/PONG
 - **socket_server.py** — Unix domain socket server at `~/.claude-pet/state.sock`, newline-delimited JSON
 - **protocol.py** — binary packet protocol: `CMD(1) + LENGTH(2 LE) + PAYLOAD(0..4096) + CRC16(2)`, builders for all commands
@@ -93,4 +93,4 @@ IDLE=0x00, THINKING=0x01, CODING=0x02, RUNNING=0x03, WAITING=0x04, SUCCESS=0x05,
 - `~/.claude-pet/daemon.pid` — PID file
 - `~/.claude-pet/hooks/on-event.sh` — installed hook script
 - `~/.claude/settings.json` — Claude Code hooks configuration (not in this repo)
-- `~/.claude/session-index.json` — read by daemon at startup to discover existing sessions
+- `~/.claude/session-index.json` — read by daemon at startup and polled every 10s for session name changes

@@ -58,6 +58,11 @@
 #define DETAIL_STATE_Y      260
 #define DETAIL_INFO_X       416
 #define DETAIL_INFO_Y       296
+#define DETAIL_SEP_Y        326
+#define DETAIL_SUMMARY_X    416
+#define DETAIL_SUMMARY_Y    356
+#define DETAIL_TOKENS_X     416
+#define DETAIL_TOKENS_Y     386
 
 // ============================================================================
 // Serial Protocol Constants
@@ -93,11 +98,14 @@
 #define MAX_SESSIONS      16
 #define MAX_SESSION_NAME  25
 #define MAX_DETAIL_TEXT   40
+#define MAX_SUMMARY_TEXT  60
 
 struct SessionEntry {
-    uint8_t state;
-    char    name[MAX_SESSION_NAME + 1];
-    char    detail[MAX_DETAIL_TEXT + 1];
+    uint8_t  state;
+    char     name[MAX_SESSION_NAME + 1];
+    char     detail[MAX_DETAIL_TEXT + 1];
+    uint32_t turnTokens;
+    char     summary[MAX_SUMMARY_TEXT + 1];
 };
 
 // ============================================================================
@@ -133,7 +141,9 @@ void checkSerialTimeout();
 GxEPD2_BW<GxEPD2_426_GDEQ0426T82, GxEPD2_426_GDEQ0426T82::HEIGHT> display(
     GxEPD2_426_GDEQ0426T82(EPD_CS, EPD_DC, EPD_RST, EPD_BUSY));
 SPISettings spiSettings(4000000, MSBFIRST, SPI_MODE0);
-PacketSerial packetSerial;
+// Default 256-byte buffer is too small for SESSION_LIST with summaries.
+// Max packet: 16 entries * 133 bytes + overhead ≈ 2.1 KB
+PacketSerial_<COBS, 0, 2560> packetSerial;
 
 // Sessions
 SessionEntry sessionList[MAX_SESSIONS];
@@ -253,6 +263,23 @@ void drawIcon(int16_t x, int16_t y, uint8_t stateId, bool inverted) {
     }
 }
 
+// Format token count: "847 tok", "1.2k tok", "24.5k tok", "2.1M tok"
+static void formatTokens(uint32_t tokens, char* buf, size_t bufLen) {
+    if (tokens == 0) {
+        buf[0] = '\0';
+        return;
+    }
+    if (tokens < 1000) {
+        snprintf(buf, bufLen, "Turn: %lu tok", (unsigned long)tokens);
+    } else if (tokens < 100000) {
+        snprintf(buf, bufLen, "Turn: %.1fk tok", tokens / 1000.0);
+    } else if (tokens < 1000000) {
+        snprintf(buf, bufLen, "Turn: %luk tok", (unsigned long)(tokens / 1000));
+    } else {
+        snprintf(buf, bufLen, "Turn: %.1fM tok", tokens / 1000000.0);
+    }
+}
+
 void drawSplitPane() {
     if (sleeping) return;
     initDisplay();
@@ -346,6 +373,30 @@ void drawSplitPane() {
         display.setCursor(DETAIL_INFO_X, DETAIL_INFO_Y);
         display.print(detailInfo);
 
+        // Separator, summary, and token count (only if session selected)
+        if (sessionCount > 0 && selectedIndex < sessionCount) {
+            const SessionEntry& sel = sessionList[selectedIndex];
+
+            // Thin separator line
+            display.drawFastHLine(DETAIL_SUMMARY_X, DETAIL_SEP_Y, DISP_W - DETAIL_SUMMARY_X - 16, GxEPD_BLACK);
+
+            // Tool summary
+            if (sel.summary[0] != '\0') {
+                display.setFont(&FreeMono9pt7b);
+                display.setCursor(DETAIL_SUMMARY_X, DETAIL_SUMMARY_Y);
+                display.print(sel.summary);
+            }
+
+            // Turn token count
+            char tokBuf[32];
+            formatTokens(sel.turnTokens, tokBuf, sizeof(tokBuf));
+            if (tokBuf[0] != '\0') {
+                display.setFont(&FreeMono9pt7b);
+                display.setCursor(DETAIL_TOKENS_X, DETAIL_TOKENS_Y);
+                display.print(tokBuf);
+            }
+        }
+
     } while (display.nextPage());
 
     screenDirty = false;
@@ -427,6 +478,32 @@ void drawRow(uint8_t visibleIdx) {
             display.setTextColor(GxEPD_BLACK);
             display.setCursor(DETAIL_INFO_X, DETAIL_INFO_Y);
             display.print(detailInfo);
+        }
+
+        // Separator line
+        if (rowY <= DETAIL_SEP_Y && rowY + LIST_ROW_H > DETAIL_SEP_Y) {
+            display.drawFastHLine(DETAIL_SUMMARY_X, DETAIL_SEP_Y, DISP_W - DETAIL_SUMMARY_X - 16, GxEPD_BLACK);
+        }
+
+        // Summary text
+        if (sessionCount > 0 && selectedIndex < sessionCount) {
+            const SessionEntry& sel = sessionList[selectedIndex];
+            if (sel.summary[0] != '\0' && rowY <= DETAIL_SUMMARY_Y && rowY + LIST_ROW_H > DETAIL_SUMMARY_Y - 14) {
+                display.setFont(&FreeMono9pt7b);
+                display.setTextColor(GxEPD_BLACK);
+                display.setCursor(DETAIL_SUMMARY_X, DETAIL_SUMMARY_Y);
+                display.print(sel.summary);
+            }
+
+            // Token count
+            char tokBuf[32];
+            formatTokens(sel.turnTokens, tokBuf, sizeof(tokBuf));
+            if (tokBuf[0] != '\0' && rowY <= DETAIL_TOKENS_Y && rowY + LIST_ROW_H > DETAIL_TOKENS_Y - 14) {
+                display.setFont(&FreeMono9pt7b);
+                display.setTextColor(GxEPD_BLACK);
+                display.setCursor(DETAIL_TOKENS_X, DETAIL_TOKENS_Y);
+                display.print(tokBuf);
+            }
         }
 
     } while (display.nextPage());
@@ -675,8 +752,29 @@ void onPacketReceived(const uint8_t* buffer, size_t size) {
                     sessionList[i].detail[0] = '\0';
                 }
 
-                // Skip tokens field (4 bytes, uint32 LE) sent by daemon
-                if (off + 4 <= payloadLen) off += 4;
+                // Parse tokens field (4 bytes, uint32 LE)
+                if (off + 4 <= payloadLen) {
+                    sessionList[i].turnTokens = payload[off]
+                        | ((uint32_t)payload[off+1] << 8)
+                        | ((uint32_t)payload[off+2] << 16)
+                        | ((uint32_t)payload[off+3] << 24);
+                    off += 4;
+                } else {
+                    sessionList[i].turnTokens = 0;
+                }
+
+                // Parse summary field (len + data)
+                if (off < payloadLen) {
+                    uint8_t summaryLen = payload[off];
+                    off++;
+                    if (off + summaryLen > payloadLen) summaryLen = payloadLen - off;
+                    if (summaryLen > MAX_SUMMARY_TEXT) summaryLen = MAX_SUMMARY_TEXT;
+                    memcpy(sessionList[i].summary, &payload[off], summaryLen);
+                    sessionList[i].summary[summaryLen] = '\0';
+                    off += summaryLen;
+                } else {
+                    sessionList[i].summary[0] = '\0';
+                }
 
                 parsed++;
             }
@@ -878,6 +976,7 @@ void checkSerialTimeout() {
 // Setup & Main Loop
 // ============================================================================
 void setup() {
+    Serial.setRxBufferSize(4096);  // Default 256 too small for SESSION_LIST packets
     Serial.begin(115200);
     delay(500);
 
@@ -888,6 +987,9 @@ void setup() {
 
     showBootSplash();
     delay(2000);
+
+    // Flush any stale data that arrived during boot
+    while (Serial.available()) Serial.read();
 
     packetSerial.setStream(&Serial);
     packetSerial.setPacketHandler(&onPacketReceived);
